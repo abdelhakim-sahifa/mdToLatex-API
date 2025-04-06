@@ -1,10 +1,5 @@
 {
   "version": 2,
-  "functions": {
-    "api/convert-to-latex/*.js": {
-      "maxDuration": 30
-    }
-  },
   "builds": [
     {
       "src": "index.js",
@@ -13,8 +8,12 @@
   ],
   "routes": [
     {
+      "src": "/api/(.*)",
+      "dest": "/index.js"
+    },
+    {
       "src": "/(.*)",
-      "dest": "index.js"
+      "dest": "/index.js"
     }
   ]
 }
