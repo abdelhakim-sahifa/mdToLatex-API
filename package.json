@@ -1,0 +1,16 @@
+{
+  "name": "md-to-latex-api",
+  "version": "1.0.0",
+  "description": "API to convert Markdown to LaTeX",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^11.10.1",
+    "axios": "^1.5.0",
+    "cors": "^2.8.5"
+  }
+}
