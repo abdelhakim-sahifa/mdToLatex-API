@@ -1,215 +1,386 @@
 const express = require('express');
-const admin = require('firebase-admin');
-const axios = require('axios');
 const cors = require('cors');
+const fs = require('fs').promises;
+const path = require('path');
+const marked = require('marked');
 
 // Initialize Express
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Firebase Configuration
-const firebaseConfig = {
-    apiKey: "AIzaSyBDdlxEi_sbc2NrjSXt9cP2cDVzJBL_WDY",
-    authDomain: "theprojectsofc.firebaseapp.com",
-    databaseURL: "https://theprojectsofc-default-rtdb.firebaseio.com",
-    projectId: "theprojectsofc",
-    storageBucket: "theprojectsofc.firebasestorage.app",
-    messagingSenderId: "825970426844",
-    appId: "1:825970426844:web:cca1e93a8b654e4269c519",
-    measurementId: "G-86RLL7LL6P"
-};
+// Local storage setup for caching
+const cacheDir = path.join(__dirname, 'conversion-cache');
 
-// Gemini Configuration
-const geminiConfiguration = {
-    API_KEY: "AIzaSyD_O4lwncp26AnF3uYYI3dTiZbYdZlaRx4",
-    BASE_URL: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key="
-};
-
-// Initialize Firebase
-admin.initializeApp({
-    credential: admin.credential.cert(require('./serviceAccountKey.json')),
-    databaseURL: firebaseConfig.databaseURL
-});
-
-const database = admin.database();
-
-// API endpoint to convert MD to LaTeX with execution time logging
-app.post('/api/convert-to-latex', async (req, res) => {
-    const totalStartTime = Date.now();
-    console.log(`[${new Date().toISOString()}] Starting conversion request`);
-    
-    try {
-        const { fileId } = req.body;
-        
-        if (!fileId) {
-            console.log(`[${new Date().toISOString()}] Missing fileId - Request failed in ${Date.now() - totalStartTime}ms`);
-            return res.status(400).json({ error: 'File ID is required' });
-        }
-        
-        console.log(`[${new Date().toISOString()}] Fetching markdown for fileId: ${fileId}`);
-        const firebaseStartTime = Date.now();
-        
-        // Get the markdown content from Firebase
-        const snapshot = await database.ref(`mdfiles/${fileId}/content`).once('value');
-        const content = snapshot.val();
-        
-        const firebaseDuration = Date.now() - firebaseStartTime;
-        console.log(`[${new Date().toISOString()}] Firebase fetch completed in ${firebaseDuration}ms`);
-        
-        if (!content) {
-            console.log(`[${new Date().toISOString()}] Markdown content not found - Request failed in ${Date.now() - totalStartTime}ms`);
-            return res.status(404).json({ error: 'Markdown content not found' });
-        }
-        
-        console.log(`[${new Date().toISOString()}] Starting Gemini API conversion`);
-        console.log(`[${new Date().toISOString()}] Markdown content length: ${content.length} characters`);
-        
-        // Convert markdown to LaTeX using Gemini
-        const geminiStartTime = Date.now();
-        const latexContent = await convertToLatex(content);
-        const geminiDuration = Date.now() - geminiStartTime;
-        
-        console.log(`[${new Date().toISOString()}] Gemini API conversion completed in ${geminiDuration}ms`);
-        console.log(`[${new Date().toISOString()}] LaTeX content length: ${latexContent.length} characters`);
-        
-        // Return the LaTeX content
-        const totalDuration = Date.now() - totalStartTime;
-        console.log(`[${new Date().toISOString()}] Total request completed in ${totalDuration}ms`);
-        
-        res.json({ 
-            original: content,
-            latex: latexContent,
-            timings: {
-                total: totalDuration,
-                firebase: firebaseDuration,
-                gemini: geminiDuration
-            }
-        });
-        
-    } catch (error) {
-        const totalDuration = Date.now() - totalStartTime;
-        console.error(`[${new Date().toISOString()}] Error converting to LaTeX after ${totalDuration}ms:`, error);
-        res.status(500).json({ 
-            error: 'Failed to convert to LaTeX', 
-            details: error.message,
-            timing: `Failed after ${totalDuration}ms`
-        });
-    }
-});
-
-// Function to convert markdown to LaTeX using Gemini with timeout
-async function convertToLatex(markdownContent) {
-    const functionStartTime = Date.now();
-    try {
-        const url = `${geminiConfiguration.BASE_URL}${geminiConfiguration.API_KEY}`;
-        
-        const payload = {
-            contents: [
-                {
-                    parts: [
-                        {
-                            text: `Convert the following Markdown content to LaTeX format, maintaining all formatting, equations, tables, and structure. Ensure proper handling of Markdown features like headers, lists, code blocks, and emphasis. Here's the Markdown content to convert:\n\n${markdownContent}`
-                        }
-                    ]
-                }
-            ],
-            generationConfig: {
-                temperature: 0.2,
-                topK: 40,
-                topP: 0.95,
-                maxOutputTokens: 8192
-            }
-        };
-        
-        console.log(`[${new Date().toISOString()}] Sending request to Gemini API`);
-        
-        // Set timeout for Gemini API request (9 seconds to stay under Vercel's limit)
-        const response = await axios.post(url, payload, {
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            timeout: 9000 // 9 seconds timeout
-        });
-        
-        console.log(`[${new Date().toISOString()}] Gemini API response received in ${Date.now() - functionStartTime}ms`);
-        
-        // Extract the LaTeX content from Gemini's response
-        const latexContent = response.data.candidates[0].content.parts[0].text;
-        return latexContent;
-        
-    } catch (error) {
-        const errorTime = Date.now() - functionStartTime;
-        
-        if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-            console.error(`[${new Date().toISOString()}] Gemini API timed out after ${errorTime}ms`);
-            throw new Error(`Gemini API request timed out after ${errorTime}ms`);
-        }
-        
-        console.error(`[${new Date().toISOString()}] Error calling Gemini API after ${errorTime}ms:`, error);
-        throw new Error(`Failed to convert markdown to LaTeX after ${errorTime}ms: ${error.message}`);
-    }
+// Create the cache directory if it doesn't exist
+async function ensureCacheDirectoryExists() {
+  try {
+    await fs.mkdir(cacheDir, { recursive: true });
+    console.log(`[${new Date().toISOString()}] Cache directory created or verified`);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Failed to create cache directory:`, err);
+  }
 }
 
-// Additional utility to save the converted LaTeX content back to Firebase
-app.post('/api/save-latex', async (req, res) => {
-    const startTime = Date.now();
-    console.log(`[${new Date().toISOString()}] Starting save-latex request`);
-    
-    try {
-        const { fileId, latexContent } = req.body;
-        
-        if (!fileId || !latexContent) {
-            console.log(`[${new Date().toISOString()}] Missing required fields - Request failed in ${Date.now() - startTime}ms`);
-            return res.status(400).json({ error: 'File ID and LaTeX content are required' });
-        }
-        
-        console.log(`[${new Date().toISOString()}] Saving LaTeX for fileId: ${fileId}`);
-        const firebaseStartTime = Date.now();
-        
-        // Save the LaTeX content to Firebase
-        await database.ref(`latexfiles/${fileId}/content`).set(latexContent);
-        await database.ref(`latexfiles/${fileId}/timestamp`).set(admin.database.ServerValue.TIMESTAMP);
-        
-        const firebaseDuration = Date.now() - firebaseStartTime;
-        console.log(`[${new Date().toISOString()}] Firebase save completed in ${firebaseDuration}ms`);
-        
-        const totalDuration = Date.now() - startTime;
-        console.log(`[${new Date().toISOString()}] Total save-latex request completed in ${totalDuration}ms`);
-        
-        res.json({ 
-            success: true, 
-            message: 'LaTeX content saved successfully',
-            timing: {
-                total: totalDuration,
-                firebaseSave: firebaseDuration
-            }
-        });
-        
-    } catch (error) {
-        const totalDuration = Date.now() - startTime;
-        console.error(`[${new Date().toISOString()}] Error saving LaTeX content after ${totalDuration}ms:`, error);
-        res.status(500).json({ 
-            error: 'Failed to save LaTeX content', 
-            details: error.message,
-            timing: `Failed after ${totalDuration}ms`
-        });
+// Configure custom Markdown to LaTeX renderer
+const latexRenderer = {
+  // Header rendering
+  heading(text, level) {
+    const headerCommands = [
+      '\\section{', 
+      '\\subsection{', 
+      '\\subsubsection{', 
+      '\\paragraph{', 
+      '\\subparagraph{', 
+      '\\subparagraph{'
+    ];
+    return `${headerCommands[level-1]}${text}}\n\n`;
+  },
+  
+  // Paragraph rendering
+  paragraph(text) {
+    return `${text}\n\n`;
+  },
+  
+  // List rendering
+  list(body, ordered) {
+    const listEnvironment = ordered ? 'enumerate' : 'itemize';
+    return `\\begin{${listEnvironment}}\n${body}\\end{${listEnvironment}}\n\n`;
+  },
+  
+  // List item rendering
+  listitem(text) {
+    return `\\item ${text}\n`;
+  },
+  
+  // Code block rendering
+  code(code, language) {
+    if (language && language !== 'text') {
+      return `\\begin{lstlisting}[language=${language}]\n${code}\n\\end{lstlisting}\n\n`;
     }
+    return `\\begin{verbatim}\n${code}\n\\end{verbatim}\n\n`;
+  },
+  
+  // Inline code rendering
+  codespan(code) {
+    return `\\texttt{${escapeLatexSpecialChars(code)}}`;
+  },
+  
+  // Bold text
+  strong(text) {
+    return `\\textbf{${text}}`;
+  },
+  
+  // Italic text
+  em(text) {
+    return `\\textit{${text}}`;
+  },
+  
+  // Links
+  link(href, title, text) {
+    return `\\href{${href}}{${text}}`;
+  },
+  
+  // Images
+  image(href, title, text) {
+    return `\\begin{figure}[h]
+\\centering
+\\includegraphics[width=0.8\\textwidth]{${href}}
+\\caption{${text || title || ''}}
+\\end{figure}`;
+  },
+  
+  // Blockquote
+  blockquote(quote) {
+    return `\\begin{quotation}\n${quote}\\end{quotation}\n\n`;
+  },
+  
+  // Tables
+  table(header, body) {
+    const columns = header.trim().split('&').length;
+    return `\\begin{tabular}{${'|c'.repeat(columns)}|}
+\\hline
+${header}\\hline
+${body}\\hline
+\\end{tabular}\n\n`;
+  },
+  
+  // Table row
+  tablerow(content) {
+    return `${content.trim()} \\\\ \\hline\n`;
+  },
+  
+  // Table cell
+  tablecell(content, flags) {
+    return `${content} & `;
+  },
+  
+  // Horizontal Rule
+  hr() {
+    return '\\hrulefill\n\n';
+  }
+};
+
+// Helper function to escape LaTeX special characters
+function escapeLatexSpecialChars(text) {
+  return text
+    .replace(/\\/g, '\\textbackslash{}')
+    .replace(/&/g, '\\&')
+    .replace(/%/g, '\\%')
+    .replace(/\$/g, '\\$')
+    .replace(/#/g, '\\#')
+    .replace(/_/g, '\\_')
+    .replace(/\{/g, '\\{')
+    .replace(/\}/g, '\\}')
+    .replace(/~/g, '\\textasciitilde{}')
+    .replace(/\^/g, '\\textasciicircum{}');
+}
+
+// Process math expressions separately
+function processMathExpressions(text) {
+  // Replace inline math expressions (between $ signs)
+  text = text.replace(/\$([^$]+)\$/g, (match, expr) => {
+    try {
+      return `$${expr}$`;
+    } catch (e) {
+      return match; // Return original if parsing fails
+    }
+  });
+  
+  // Replace block math expressions (between $$ signs)
+  text = text.replace(/\$\$([^$]+)\$\$/g, (match, expr) => {
+    try {
+      return `\\begin{equation}${expr}\\end{equation}`;
+    } catch (e) {
+      return match; // Return original if parsing fails
+    }
+  });
+  
+  return text;
+}
+
+// Function to convert markdown to LaTeX with chunks processing for large documents
+function convertMarkdownToLatex(markdownContent) {
+  console.log(`[${new Date().toISOString()}] Starting conversion of ${markdownContent.length} characters`);
+  
+  try {
+    // Set the custom renderer
+    marked.use({ renderer: latexRenderer });
+    
+    // If the content is very large, process it in chunks
+    if (markdownContent.length > 30000) {
+      console.log(`[${new Date().toISOString()}] Large document detected, processing in chunks`);
+      return processLargeDocument(markdownContent);
+    }
+    
+    // Pre-process math expressions
+    const processedMarkdown = processMathExpressions(markdownContent);
+    
+    // Convert to LaTeX
+    let latexOutput = marked.parse(processedMarkdown);
+    
+    // Add LaTeX document structure
+    latexOutput = wrapWithLatexStructure(latexOutput);
+    
+    console.log(`[${new Date().toISOString()}] Conversion completed, generated ${latexOutput.length} characters`);
+    return latexOutput;
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Error converting markdown to LaTeX:`, error);
+    throw new Error(`Failed to convert markdown to LaTeX: ${error.message}`);
+  }
+}
+
+// Process large documents in chunks
+function processLargeDocument(markdownContent) {
+  // Split by major sections (headers)
+  const sections = markdownContent.split(/(?=^#{1,6}\s)/m);
+  console.log(`[${new Date().toISOString()}] Document split into ${sections.length} sections`);
+  
+  let latexContent = '';
+  
+  // Process each section
+  for (let i = 0; i < sections.length; i++) {
+    const section = sections[i];
+    console.log(`[${new Date().toISOString()}] Processing section ${i+1}/${sections.length}`);
+    
+    // Pre-process math expressions
+    const processedSection = processMathExpressions(section);
+    
+    // Convert to LaTeX
+    const latexSection = marked.parse(processedSection);
+    latexContent += latexSection;
+  }
+  
+  // Add LaTeX document structure
+  latexContent = wrapWithLatexStructure(latexContent);
+  
+  console.log(`[${new Date().toISOString()}] Large document processing completed`);
+  return latexContent;
+}
+
+// Add full LaTeX document structure
+function wrapWithLatexStructure(content) {
+  return `\\documentclass{article}
+\\usepackage[utf8]{inputenc}
+\\usepackage{amsmath}
+\\usepackage{amssymb}
+\\usepackage{graphicx}
+\\usepackage{hyperref}
+\\usepackage{listings}
+\\usepackage{color}
+\\usepackage{array}
+\\usepackage{booktabs}
+\\usepackage{longtable}
+\\usepackage{tabularx}
+
+\\title{Converted Document}
+\\author{}
+\\date{\\today}
+
+\\begin{document}
+
+\\maketitle
+
+${content}
+
+\\end{document}`;
+}
+
+// Generate a cache key from content
+function generateCacheKey(content) {
+  // Simple hash function for content
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    const char = content.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return `md-${Math.abs(hash).toString(16)}`;
+}
+
+// Check cache for existing conversion
+async function getFromCache(cacheKey) {
+  try {
+    const filePath = path.join(cacheDir, `${cacheKey}.json`);
+    const data = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(data);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error(`[${new Date().toISOString()}] Error reading from cache:`, err);
+    }
+    return null;
+  }
+}
+
+// Save result to cache
+async function saveToCache(cacheKey, content) {
+  try {
+    const filePath = path.join(cacheDir, `${cacheKey}.json`);
+    await fs.writeFile(filePath, JSON.stringify({
+      content,
+      timestamp: Date.now()
+    }, null, 2));
+    console.log(`[${new Date().toISOString()}] Conversion result cached: ${cacheKey}`);
+    return true;
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Failed to cache result:`, err);
+    return false;
+  }
+}
+
+// API endpoint to convert MD to LaTeX
+app.post('/api/convert-to-latex', async (req, res) => {
+  const totalStartTime = Date.now();
+  console.log(`[${new Date().toISOString()}] Starting conversion request`);
+  
+  try {
+    const { content } = req.body;
+    
+    if (!content) {
+      console.log(`[${new Date().toISOString()}] Missing markdown content`);
+      return res.status(400).json({ error: 'Markdown content is required' });
+    }
+    
+    // Generate cache key
+    const cacheKey = generateCacheKey(content);
+    
+    // Check if we have this conversion cached
+    const cachedResult = await getFromCache(cacheKey);
+    if (cachedResult) {
+      console.log(`[${new Date().toISOString()}] Returning cached conversion result`);
+      const totalDuration = Date.now() - totalStartTime;
+      return res.json({
+        latex: cachedResult.content,
+        timings: {
+          total: totalDuration,
+          cache: true
+        }
+      });
+    }
+    
+    console.log(`[${new Date().toISOString()}] Starting markdown to LaTeX conversion`);
+    const conversionStartTime = Date.now();
+    
+    // Convert markdown to LaTeX
+    const latexContent = convertMarkdownToLatex(content);
+    
+    const conversionDuration = Date.now() - conversionStartTime;
+    console.log(`[${new Date().toISOString()}] Conversion completed in ${conversionDuration}ms`);
+    
+    // Save to cache for future requests
+    await saveToCache(cacheKey, latexContent);
+    
+    // Return the LaTeX content
+    const totalDuration = Date.now() - totalStartTime;
+    console.log(`[${new Date().toISOString()}] Total request completed in ${totalDuration}ms`);
+    
+    res.json({ 
+      latex: latexContent,
+      timings: {
+        total: totalDuration,
+        conversion: conversionDuration
+      }
+    });
+    
+  } catch (error) {
+    const totalDuration = Date.now() - totalStartTime;
+    console.error(`[${new Date().toISOString()}] Error converting to LaTeX:`, error);
+    res.status(500).json({ 
+      error: 'Failed to convert to LaTeX', 
+      details: error.message,
+      timing: `Failed after ${totalDuration}ms`
+    });
+  }
 });
 
 // Simple health check endpoint
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development'
-    });
+  res.json({ 
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
 });
 
-// Start the server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+// Initialize on startup
+async function startup() {
+  console.log(`[${new Date().toISOString()}] Starting server initialization`);
+  
+  // Create cache directory
+  await ensureCacheDirectoryExists();
+  
+  // Start the server
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
     console.log(`[${new Date().toISOString()}] Server running on port ${PORT}`);
+    console.log(`[${new Date().toISOString()}] Ready to convert markdown to LaTeX`);
+  });
+}
+
+// Start the server
+startup().catch(error => {
+  console.error(`[${new Date().toISOString()}] Startup error:`, error);
+  process.exit(1);
 });
 
 module.exports = app;
